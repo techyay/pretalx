@@ -1,11 +1,21 @@
-from django.db.models import Count
-from django.http import Http404
+import datetime as dt
+import json
+import logging
+
+import jwt
+import requests
+from django.db import IntegrityError
+from django.http import Http404, JsonResponse
+from django.shortcuts import get_object_or_404
+from django.utils.decorators import method_decorator
 from django.utils.functional import cached_property
+from django.views import View
+from django.views.decorators.csrf import csrf_exempt
 from django_filters import rest_framework as filters
 from django_scopes import scopes_disabled
-from rest_framework import viewsets
-from rest_framework.decorators import action
-from rest_framework.response import Response
+from rest_framework import status, viewsets
+from pretalx.person.models import User
+from rest_framework.authentication import get_authorization_header
 
 from pretalx.api.serializers.submission import (
     ScheduleListSerializer,
@@ -15,8 +25,14 @@ from pretalx.api.serializers.submission import (
     SubmissionSerializer,
     TagSerializer,
 )
+
+from pretalx.common import exceptions
 from pretalx.schedule.models import Schedule
 from pretalx.submission.models import Submission, SubmissionStates, Tag
+from pretalx.submission.models.submission import (
+    SubmissionFavourite,
+    SubmissionFavouriteSerializer,
+)
 
 with scopes_disabled():
 
@@ -27,6 +43,7 @@ with scopes_disabled():
             model = Submission
             fields = ("state", "content_locale", "submission_type", "is_featured")
 
+logger = logging.getLogger(__name__)
 
 class SubmissionViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = SubmissionSerializer
@@ -34,15 +51,8 @@ class SubmissionViewSet(viewsets.ReadOnlyModelViewSet):
     lookup_field = "code__iexact"
     search_fields = ("title", "speakers__name")
     filterset_class = SubmissionFilter
-    permission_map = {
-        "favourite": "agenda.view_schedule",
-        "favourite_object": "agenda.view_submission",
-    }
 
     def get_queryset(self):
-        base_qs = self.request.event.submissions.all().annotate(
-            favourite_count=Count("favourites")
-        )
         if self.request._request.path.endswith(
             "/talks/"
         ) or not self.request.user.has_perm(
@@ -55,12 +65,12 @@ class SubmissionViewSet(viewsets.ReadOnlyModelViewSet):
                 or not self.request.event.current_schedule
             ):
                 return Submission.objects.none()
-            return base_qs.filter(
+            return self.request.event.submissions.filter(
                 pk__in=self.request.event.current_schedule.talks.filter(
                     is_visible=True
                 ).values_list("submission_id", flat=True)
             )
-        return base_qs
+        return self.request.event.submissions.all()
 
     def get_serializer_class(self):
         if self.request.user.has_perm("orga.change_submissions", self.request.event):
@@ -86,33 +96,6 @@ class SubmissionViewSet(viewsets.ReadOnlyModelViewSet):
             questions=self.serializer_questions,
             **kwargs,
         )
-
-    @action(detail=False, methods=["GET"])
-    def favourites(self, request, **kwargs):
-        if not request.user.is_authenticated:
-            raise Http404
-        # Return ical file if accept header is set to text/calendar
-        if request.accepted_renderer.format == "ics":
-            return self.favourites_ical(request)
-        return Response(
-            [
-                sub.code
-                for sub in Submission.objects.filter(
-                    favourites__user__in=[request.user], event=request.event
-                )
-            ]
-        )
-
-    @action(detail=True, methods=["POST", "DELETE"])
-    def favourite(self, request, **kwargs):
-        if not request.user.is_authenticated:
-            raise Http404
-        submission = self.get_object()
-        if request.method == "POST":
-            submission.add_favourite(request.user)
-        elif request.method == "DELETE":
-            submission.remove_favourite(request.user)
-        return Response({})
 
 
 class ScheduleViewSet(viewsets.ReadOnlyModelViewSet):
@@ -165,3 +148,124 @@ class TagViewSet(viewsets.ReadOnlyModelViewSet):
         if self.request.user.has_perm("orga.view_submissions", self.request.event):
             return self.request.event.tags.all()
         return Tag.objects.none()
+
+
+class SubmissionFavouriteView(View):
+    """
+    A view for handling user's favourite talks.
+
+    - GET: Retrieve the list of favourite talks for the authenticated user.
+    - PUT: Add talks to the user's favourite list.
+    """
+
+    @method_decorator(csrf_exempt)
+    def dispatch(self, request, *args, **kwargs):
+        return super().dispatch(request, *args, **kwargs)
+
+    def get(self, request, *args, **kwargs) -> JsonResponse:
+        """
+        Handle GET requests to retrieve the list of favourite talks
+        """
+        try:
+            user_id = request.user.id
+            # user_id = 52
+            fav_talks = get_object_or_404(SubmissionFavourite, user=user_id)
+            return JsonResponse(fav_talks.talk_list, safe=False)
+        except Http404:
+            # As user not have any favourite talk yet
+            return JsonResponse([], safe=False)
+        except Exception as e:
+            logger.error(f"unexpected error happened: {str(e)}")
+            return JsonResponse(
+                {"error": str(e)},
+                safe=False,
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+    @staticmethod
+    def post(request, *args, **kwargs) -> JsonResponse:
+        """
+        Handle POST requests to add talks to the user's favourite list.
+        """
+        try:
+            user_id = request.user.id
+
+            talk_list = json.loads(request.body.decode())
+            talk_list_valid = []
+            for talk in talk_list:
+                with scopes_disabled():
+                    if Submission.objects.filter(code=talk).exists():
+                        talk_list_valid.append(talk)
+
+            data = {"user": user_id, "talk_list": talk_list_valid}
+            serializer = SubmissionFavouriteSerializer(data=data)
+            if serializer.is_valid():
+                fav_talks = serializer.save(user_id, talk_list_valid)
+
+            else:
+                logger.error(f"Validation error: {serializer.errors}")
+                return JsonResponse(
+                    {"error": serializer.errors},
+                    safe=False,
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            return JsonResponse(
+                fav_talks.talk_list, safe=False, status=status.HTTP_200_OK
+            )
+
+        except Http404:
+            logger.info("User not login yet, so can't add favourite talks.")
+            return JsonResponse(
+                "user_not_logged_in", safe=False, status=status.HTTP_400_BAD_REQUEST
+            )
+        except IntegrityError as e:
+            logger.error(f"Integrity error: {str(e)}")
+            return JsonResponse(
+                {"error": str(e)}, safe=False, status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception as e:
+            logger.error(f"Unexpected error: {str(e)}")
+            return JsonResponse(
+                {"error": str(e)},
+                safe=False,
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+    @staticmethod
+    def get_user_video_token(user_code, video_settings):
+        iat = dt.datetime.utcnow()
+        exp = iat + dt.timedelta(days=30)
+        payload = {
+            "iss": video_settings.issuer,
+            "aud": video_settings.audience,
+            "exp": exp,
+            "iat": iat,
+            "uid": user_code,
+        }
+        token = jwt.encode(payload, video_settings.secret, algorithm="HS256")
+        return token
+
+    @staticmethod
+    def get_user_from_token(request, video_settings):
+        auth_header = get_authorization_header(request).split()
+        if not auth_header:
+            raise Http404
+        if auth_header and auth_header[0].lower() == b"bearer":
+            if len(auth_header) == 1:
+                raise exceptions.AuthenticationFailed(
+                    "Invalid token header. No credentials provided."
+                )
+            elif len(auth_header) > 2:
+                raise exceptions.AuthenticationFailed(
+                    "Invalid token header. Token string should not contain spaces."
+                )
+        token_decode = jwt.decode(
+            auth_header[1],
+            video_settings.secret,
+            algorithms=["HS256"],
+            audience=video_settings.audience,
+            issuer=video_settings.issuer,
+        )
+        user_code = token_decode.get("uid")
+        return get_object_or_404(User, code=user_code).id

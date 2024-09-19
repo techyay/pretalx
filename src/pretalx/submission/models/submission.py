@@ -6,13 +6,18 @@ from itertools import repeat
 from django.conf import settings
 from django.core.validators import MinValueValidator
 from django.db import models
+from django.db.models import JSONField
 from django.db.models.fields.files import FieldFile
+from django.shortcuts import get_object_or_404
 from django.utils.crypto import get_random_string
 from django.utils.functional import cached_property
 from django.utils.timezone import now
 from django.utils.translation import gettext_lazy as _
+from django.utils.translation import ngettext_lazy as _n
 from django.utils.translation import pgettext_lazy
 from django_scopes import ScopedManager
+from django_scopes import ScopedManager, scopes_disabled
+from rest_framework import serializers
 
 from pretalx.common.exceptions import SubmissionError
 from pretalx.common.models.choices import Choices
@@ -23,6 +28,7 @@ from pretalx.common.text.serialize import serialize_duration
 from pretalx.common.urls import EventUrls
 from pretalx.mail.models import MailTemplate, QueuedMail
 from pretalx.submission.signals import submission_state_change
+from pretalx.person.models import User
 
 
 def generate_invite_code(length=32):
@@ -934,18 +940,38 @@ class Submission(GenerateCode, PretalxModel):
         SubmissionFavourite.objects.filter(user=user, submission=self).delete()
 
 
-class SubmissionFavourite(PretalxModel):
-    user = models.ForeignKey(
+class SubmissionFavourite(models.Model):
+    user = models.OneToOneField(
         to="person.User",
-        on_delete=models.CASCADE,
-        related_name="submission_favourites",
+        related_name="submission_favorites",
+        on_delete=models.PROTECT,
+        verbose_name=_n("User", "Users", 1),
     )
-    submission = models.ForeignKey(
-        to="submission.Submission",
-        on_delete=models.CASCADE,
-        related_name="favourites",
-    )
-    objects = ScopedManager(event="submission__event")
+    talk_list = JSONField(null=True, blank=True, verbose_name=_("List favourite talk"))
 
     class Meta:
-        unique_together = (("user", "submission"),)
+        db_table = '"submission_submission_favourites"'
+
+
+class SubmissionFavouriteSerializer(serializers.ModelSerializer):
+
+    user = serializers.SlugRelatedField(slug_field="id", read_only=True)
+
+    def __init__(self, user_id=None, **kwargs):
+        super().__init__(**kwargs)
+        self.user = user_id
+
+    class Meta:
+        model = SubmissionFavourite
+        fields = ["user", "talk_list"]
+
+    def save(self, user_id, talk_code):
+        with scopes_disabled():
+            user = get_object_or_404(User, id=user_id)
+            submission_fav, created = SubmissionFavourite.objects.get_or_create(
+                user=user
+            )
+            submission_fav.talk_list = talk_code
+            submission_fav.save()
+            return submission_fav
+
